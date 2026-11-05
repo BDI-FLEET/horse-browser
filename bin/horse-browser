@@ -97,11 +97,11 @@ ensure_harness() {
     done
     if command -v uv >/dev/null 2>&1; then
       uv venv --quiet --python 3.12 "$HARNESS_DIR/.venv" \
-        && uv pip install --quiet --python "$HARNESS_PY" 'cdp-use==1.4.5' 'websockets==15.0.1'
+        && uv pip install --quiet --python "$HARNESS_PY" 'cdp-use==1.4.5' 'websockets==15.0.1' 'anyio>=4.14.2' 'certifi>=2026.10.18' 'idna>=3.15'
     elif command -v python3 >/dev/null 2>&1 \
         && python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
       python3 -m venv "$HARNESS_DIR/.venv" \
-        && "$HARNESS_PY" -m pip install --quiet 'cdp-use==1.4.5' 'websockets==15.0.1'
+        && "$HARNESS_PY" -m pip install --quiet 'cdp-use==1.4.5' 'websockets==15.0.1' 'anyio>=4.14.2' 'certifi>=2026.10.18' 'idna>=3.15'
     fi
     [ -x "$HARNESS_PY" ] || {
       echo "horse-browser: harness venv setup failed — need uv (https://docs.astral.sh/uv) or python3 ≥3.11" >&2
