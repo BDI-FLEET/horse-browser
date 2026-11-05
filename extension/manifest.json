@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Agent Tab Grouper",
-  "version": "0.16.0",
+  "version": "0.16.1",
   "description": "Renders a per-session tab group for CDP-driven automation tabs, serves the Agent Monitor (a live CCTV grid), and carries Tier 1 realness \u2014 a Chrome-real fingerprint (UA-CH + sec-ch-ua), with the version derived from this browser rather than stored. Never a source of truth: which tabs belong to a session is answered from that session's registry over plain CDP, so the harness works on browsers with no extension at all.",
   "icons": {
     "16": "icons/icon16.png",
