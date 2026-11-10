@@ -49,6 +49,8 @@ ANCHOR_START = os.environ.get("BH_ANCHOR_START", "").strip()
 # Long enough that no realistic gap between an agent's calls flaps the page's focus;
 # short enough that a tab nobody is driving stops painting within a minute.
 FOCUS_TTL = float(os.environ.get("HORSE_BROWSER_FOCUS_TTL", "60"))
+# Seconds of silence after which the session's own blank tabs are closed; 0 keeps them.
+BLANK_TTL = float(os.environ.get("HORSE_BROWSER_BLANK_TTL", "600"))
 
 
 def _session_label():
@@ -293,6 +295,11 @@ def is_real_page(t):
 NEW_TAB_URLS = ("chrome://newtab", "chrome://new-tab-page", "edge://newtab", "about:newtab")
 
 
+def is_blank_page(t):
+    """A tab holding nothing: no page was ever loaded into it, so closing it loses no work."""
+    return t.get("type") == "page" and t.get("url", "") in ("", "about:blank")
+
+
 def is_reusable_new_tab_page(t):
     """The browser's New Tab Page — nobody's work, safe to take over."""
     return t.get("type") == "page" and t.get("url", "").startswith(NEW_TAB_URLS)
@@ -329,6 +336,7 @@ class Daemon:
         self.has_extension = None  # probed once in start(); drives _apply_realness
         self.leased = False   # is focus emulation currently held on self.session?
         self.last_use = 0.0   # monotonic clock of the last call that drove the page
+        self.last_request = time.monotonic()   # …and of the last request of any kind
 
     async def attach_first_page(self):
         """Attach to THIS session's tab. Sets self.session. Returns attached target or None.
@@ -563,6 +571,8 @@ class Daemon:
         if ANCHOR_PID and _session_label():
             asyncio.create_task(self._watchdog())
         asyncio.create_task(self._lease_sweeper())
+        if BLANK_TTL > 0 and _session_label():
+            asyncio.create_task(self._blank_sweeper())
         orig = self.cdp._event_registry.handle_event
         async def tap(method, params, session_id=None):
             self.events.append({"method": method, "params": params, "session_id": session_id})
@@ -678,6 +688,48 @@ class Daemon:
                 log(f"foreground lease idle {FOCUS_TTL:.0f}s — releasing (tab stops painting)")
                 await self._lease_drop()
 
+    async def _blank_sweeper(self, interval=None):
+        """Close this session's blank tabs once nobody has called for BLANK_TTL.
+
+        A session that prunes its tabs and calls again, or only ever reads, is left holding an
+        about:blank per attach. The watchdog closes them when the session's process dies, but
+        an agent session stays open for days after its browsing is done. The next call after a
+        sweep re-attaches and gets a tab as a first call does."""
+        if interval is None:
+            interval = max(1.0, min(30.0, BLANK_TTL / 4.0))
+        while not self.stop.is_set():
+            try:
+                await asyncio.wait_for(self.stop.wait(), timeout=interval)
+                return
+            except asyncio.TimeoutError:
+                pass
+            if (time.monotonic() - self.last_request) < BLANK_TTL:
+                continue
+            try:
+                await self._close_own_blank_tabs()
+            except Exception as e:
+                log(f"blank sweep failed: {e}")
+
+    async def _close_own_blank_tabs(self):
+        """Close every blank tab the registry says is ours. Returns the ids it closed."""
+        own = set(_tracked_tabs())
+        if self.target_id:
+            own.add(self.target_id)
+        if not own:
+            return []
+        targets = (await self.cdp.send_raw("Target.getTargets"))["targetInfos"]
+        closed = []
+        for t in targets:
+            if t["targetId"] in own and is_blank_page(t):
+                try:
+                    await self.cdp.send_raw("Target.closeTarget", {"targetId": t["targetId"]})
+                    closed.append(t["targetId"])
+                except Exception as e:
+                    log(f"blank sweep: {t['targetId']} not closed: {e}")
+        if closed:
+            log(f"blank sweep: closed {len(closed)} idle blank tab(s)")
+        return closed
+
     async def _watchdog(self, interval=30):
         """Self-reap: when the anchoring agent-session process dies, close this
         session's tabs and shut down — no launcher sweep needed for a live daemon.
@@ -776,6 +828,7 @@ class Daemon:
         # this one is pinned elsewhere and rebuild it — see lifecycle.ensure_daemon.
         if meta == "ping":        return {"pong": True, "pid": os.getpid(),
                                           "endpoint": os.environ.get("BU_CDP_WS") or os.environ.get("BU_CDP_URL")}
+        self.last_request = time.monotonic()
         if meta == "drain_events":
             # Waiting on a page is driving it: wait_for_load / wait_for_network_idle poll
             # here without issuing a CDP call, and a page that goes hidden mid-wait throttles

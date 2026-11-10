@@ -4,7 +4,8 @@
 The extension is the only thing that can act on a *running* browser's tabs, groups
 and storage, and its service worker is reachable like any other CDP target. That
 makes this the launcher's one channel INTO a live browser — used to reap dead
-sessions' tabs and to tell the extension which debug port it is living on.
+sessions' tabs and to tell the extension which debug port it is living on. The same
+socket code asks the browser itself for its targets (targets, browser_call).
 
 Stdlib only (hand-rolled websocket framing): the launcher must work on a machine
 where nothing but python3 is installed.
@@ -68,13 +69,44 @@ def ws_recv(s):
     return rd(ln)
 
 
+def _call(s, method, params, timeout):
+    """One CDP command on an open socket; its result, or None if the reply never comes."""
+    ws_send(s, json.dumps({"id": 1, "method": method, "params": params or {}}))
+    s.settimeout(timeout)
+    for _ in range(200):
+        m = json.loads(ws_recv(s))
+        if m.get("id") == 1:
+            return m.get("result")
+    return None
+
+
+def browser_call(port, method, params=None, timeout=5):
+    """One CDP command on the browser's own endpoint. Raises when the browser does not answer."""
+    s = ws_connect(port, http_json(port, "/json/version")["webSocketDebuggerUrl"], timeout=timeout)
+    try:
+        result = _call(s, method, params, timeout)
+    finally:
+        s.close()
+    if result is None:
+        raise ConnectionError(f"no reply to {method}")
+    return result
+
+
+def targets(port):
+    """Every target the browser has, asked of the browser itself.
+
+    Not /json/list: that listing has been seen to come back empty on a browser holding twenty
+    tabs, and a reader that takes "no tabs" at its word concludes every tab is already closed."""
+    return browser_call(port, "Target.getTargets")["targetInfos"]
+
+
 def service_workers(port):
     """Every extension service-worker target in that browser, ours or not."""
     try:
-        return [t for t in http_json(port, "/json/list")
+        return [dict(t, webSocketDebuggerUrl=f"ws://127.0.0.1:{port}/devtools/page/{t['targetId']}")
+                for t in targets(port)
                 if t.get("type") == "service_worker"
-                and t.get("url", "").startswith("chrome-extension://")
-                and t.get("webSocketDebuggerUrl")]
+                and t.get("url", "").startswith("chrome-extension://")]
     except Exception:
         return []
 
@@ -94,17 +126,15 @@ _NOT_MINE = "__not_horse_sw__"
 def _eval_on(port, ws_url, expr, timeout):
     try:
         s = ws_connect(port, ws_url, timeout=min(5, timeout))
-        ws_send(s, json.dumps({"id": 1, "method": "Runtime.evaluate",
-                               "params": {"expression": f"({_MINE}) ? ({expr}) : '{_NOT_MINE}'",
-                                          "awaitPromise": True, "returnByValue": True}}))
-        s.settimeout(timeout)
-        for _ in range(200):
-            m = json.loads(ws_recv(s))
-            if m.get("id") == 1:
-                return ((m.get("result") or {}).get("result") or {}).get("value")
+        try:
+            result = _call(s, "Runtime.evaluate",
+                           {"expression": f"({_MINE}) ? ({expr}) : '{_NOT_MINE}'",
+                            "awaitPromise": True, "returnByValue": True}, timeout)
+        finally:
+            s.close()
+        return ((result or {}).get("result") or {}).get("value")
     except Exception:
         return None
-    return None
 
 
 def evaluate(port, expr, wait_s=0, timeout=8):

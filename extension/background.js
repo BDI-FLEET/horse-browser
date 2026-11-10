@@ -141,7 +141,7 @@ self.activeTabTargets = async () => {
   return tabs.map(t => idByTab.get(t.id)).filter(Boolean);
 };
 
-// Close STRAY tabs — ungrouped about:blank left by something outside the normal paths.
+// Close STRAY tabs — about:blank that no session's registry claims.
 // This is janitorial, NOT ownership: a session's dead tabs are closed from its registry
 // over plain CDP (bin/horse-browser reap_orphan_tabs), which works with or without this
 // extension. A stray by definition appears in no registry, and finding one needs
@@ -151,19 +151,33 @@ self.activeTabTargets = async () => {
 // function may never touch one. That guard is what keeps the two rules from colliding:
 // groupTab is best-effort, so a session's tab CAN end up ungrouped, and without the
 // guard this would read that tab as a stray and close a live session's work.
-self.sweepStrayTabs = async (claimed) => {
+//
+// A tab group is no claim. The browser restores a relaunched window's tabs with their
+// groups and with NEW target ids, so every restored blank is grouped and in no registry;
+// reading the group as ownership kept each of them open for good.
+//
+// `claimed` is a snapshot, and a tab is minted a moment before its registry line is
+// written. `minAgeMs` leaves a tab that young alone; the caller sets it.
+const strayTabs = async (claimed, minAgeMs) => {
   const known = new Set(Array.isArray(claimed) ? claimed : []);
   const tabs = await chrome.tabs.query({});
   const targets = await chrome.debugger.getTargets();
   const idByTab = new Map(targets.filter(t => t.tabId).map(t => [t.tabId, t.id]));
-  const stray = tabs.filter(t =>
+  const now = Date.now();
+  return tabs.filter(t =>
     !t.pinned &&                                                  // never the pinned Monitor
-    t.groupId < 0 &&                                              // grouped ⇒ a session painted it
     ((t.url || "") === "" || t.url === "about:blank") &&
+    now - (t.lastAccessed || 0) >= minAgeMs &&
     !known.has(idByTab.get(t.id)));                               // claimed ⇒ not ours to judge
+};
+self.sweepStrayTabs = async (claimed, minAgeMs = 0) => {
+  const stray = await strayTabs(claimed, minAgeMs);
   for (const t of stray) { try { await chrome.tabs.remove(t.id); } catch {} }
   return { closed: stray.length };
 };
+// What sweepStrayTabs would close, closing nothing — the launcher's dry run.
+self.countStrayTabs = async (claimed, minAgeMs = 0) =>
+  ({ closed: (await strayTabs(claimed, minAgeMs)).length });
 
 // The Agent Monitor — a CCTV grid of every session's live tabs. It's a normal extension
 // page that does its own CDP work as a second client on this browser's debug port (which the

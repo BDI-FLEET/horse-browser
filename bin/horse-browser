@@ -796,6 +796,8 @@ PY
 # ~/.config/horse-browser/tabs/<BU_NAME> (helpers._hb_track, daemon._track_target), so a
 # registry file with no live daemon behind it names EXACTLY the tabs to close — by id,
 # over the DevTools HTTP endpoint. No tab groups, no codename derivation, no extension.
+# Which of them are still open is asked of the browser itself (tools/sw_eval.py targets),
+# and a registry is unlinked only once its tabs are seen to be gone.
 # That is also why this now works on a browser we didn't launch, which the old
 # group-title sweep could not do at all.
 #
@@ -803,17 +805,19 @@ PY
 # anchor — unverifiable, kept conservatively, exactly like reap_orphan_daemons). Hard
 # safety: never acts on an empty live set, which would read as "everything is dead".
 #
-# Then a JANITORIAL sweep closes ungrouped stray about:blank — leaks from outside our
-# paths. That is NOT ownership (a stray appears in no registry), it needs chrome.tabs to
-# spot, and so it is the one piece that still runs through the extension. It may never
-# touch a tab any registry claims; see sweepStrayTabs.
+# Then a JANITORIAL sweep closes stray about:blank — the ones no registry claims, in a
+# tab group or not: leaks from outside our paths, and every blank a relaunch restored
+# under a new id. That is NOT ownership (a stray appears in no registry), it needs
+# chrome.tabs to spot, and so it is the one piece that still runs through the extension.
+# It may never touch a tab any registry claims; see sweepStrayTabs.
 #
 # HORSE_BROWSER_NO_TAB_REAP=1 disables it. DRYRUN via HORSE_BROWSER_REAP_DRYRUN.
+# HORSE_BROWSER_STRAY_AGE=<s> is how old a stray must be before it is closed (default 60).
 reap_orphan_tabs() {
   [ -n "${HORSE_BROWSER_NO_TAB_REAP:-}" ] && return 0
   command -v python3 >/dev/null 2>&1 || return 0
   python3 - "$PORT" "$ROOT/tools" <<'PY' || true
-import sys, os, json, glob, subprocess, urllib.request
+import sys, os, json, glob, subprocess, time, urllib.request
 port, tools = sys.argv[1], sys.argv[2]
 dry = bool(os.environ.get("HORSE_BROWSER_REAP_DRYRUN"))
 TABS = os.path.expanduser("~/.config/horse-browser/tabs")
@@ -857,15 +861,24 @@ if not live:                                # safety: never reap when we can see
 def http(path):
     return urllib.request.urlopen("http://127.0.0.1:%s%s" % (port, path), timeout=3).read()
 
+sys.path.insert(0, tools)
 try:
-    open_ids = {t.get("id") for t in json.loads(http("/json/list"))}
+    from sw_eval import evaluate, targets
+except Exception:
+    sys.exit(0)                             # no way to ask the browser — nothing safe to do here
+
+def open_ids():
+    return {t.get("targetId") for t in targets(port)}
+
+try:
+    before = open_ids()
 except Exception:
     sys.exit(0)                             # browser not answering — nothing safe to do here
 
 # Pass 1 — ownership. Every registry with no live daemon behind it is a dead session;
 # its ids are precisely its tabs. `claimed` accumulates ALL of them, live and dead, and
 # is what pass 2 is forbidden to touch.
-claimed, dead_files, closed = set(), [], 0
+claimed, dead, closed = set(), {}, 0
 for path in sorted(glob.glob(os.path.join(TABS, "*"))):
     # glob("*") already skips the dotfiles the registry writers use for their lock and
     # temp files. Belt and braces: a non-registry name here would be read as a dead
@@ -880,38 +893,44 @@ for path in sorted(glob.glob(os.path.join(TABS, "*"))):
     claimed.update(ids)
     if os.path.basename(path) in live:
         continue
-    dead_files.append(path)
-    for tid in ids:
-        if tid not in open_ids:             # already gone; nothing to close
-            continue
+    dead[path] = [tid for tid in ids if tid in before]
+    for tid in dead[path]:
         if not dry:
             try: http("/json/close/" + tid)
-            except Exception: continue
-        closed += 1
-if not dry:
-    for path in dead_files:
-        try: os.unlink(path)                # a registry dies with its session
+            except Exception: pass
+if dry:
+    closed = sum(len(ids) for ids in dead.values())
+elif dead:
+    # A registry dies with its session — but only once its tabs are seen to be gone. It is the
+    # one record of them: unlinked over a tab that is still open, that tab belongs to nobody
+    # and no later sweep can name it. Whatever survived stays listed for the next reap.
+    asked = {tid for ids in dead.values() for tid in ids}
+    after = None
+    for _ in range(10):                     # a close is acknowledged before the tab is gone
+        try: after = open_ids()
+        except Exception: after = None
+        if after is not None and not (asked & after): break
+        time.sleep(0.2)
+    for path, ids in dead.items():
+        left = ids if after is None else [tid for tid in ids if tid in after]
+        closed += len(ids) - len(left)
+        try:
+            if left:
+                tmp = os.path.join(TABS, ".%s.%d.tmp" % (os.path.basename(path), os.getpid()))
+                with open(tmp, "w") as f: f.write(json.dumps(left))
+                os.replace(tmp, path)
+            else:
+                os.unlink(path)
         except OSError: pass
 
-# Pass 2 — janitorial. Owned mode only, and never a claimed tab.
-sys.path.insert(0, tools)
-try:
-    from sw_eval import evaluate
-except Exception:
-    evaluate = None
-if evaluate is not None:
-    sweep = ("(async()=>{const claimed=%s;const r=await self.sweepStrayTabs(claimed);return r;})()"
-             % json.dumps(sorted(claimed)))
-    if dry:                                 # count strays without removing any
-        sweep = ("(async()=>{const known=new Set(%s);const tabs=await chrome.tabs.query({});"
-                 "const tg=await chrome.debugger.getTargets();"
-                 "const id=new Map(tg.filter(t=>t.tabId).map(t=>[t.tabId,t.id]));"
-                 "return {closed:tabs.filter(t=>!t.pinned&&t.groupId<0&&((t.url||'')===''"
-                 "||t.url==='about:blank')&&!known.has(id.get(t.id))).length};})()"
-                 % json.dumps(sorted(claimed)))
-    val = evaluate(port, sweep)             # None = no extension; the janitor simply doesn't run
-    try: closed += (val or {}).get("closed", 0)
-    except Exception: pass
+# Pass 2 — janitorial. Never a claimed tab, and never one younger than the age below: a
+# tab exists a moment before its registry line does, and `claimed` was read before that.
+stray_age_ms = int(float(os.environ.get("HORSE_BROWSER_STRAY_AGE", "60")) * 1000)
+sweep = ("self.%s(%s, %d)" % ("countStrayTabs" if dry else "sweepStrayTabs",
+                              json.dumps(sorted(claimed)), stray_age_ms))
+val = evaluate(port, sweep)             # None = no extension; the janitor simply doesn't run
+try: closed += (val or {}).get("closed", 0)
+except Exception: pass
 
 if closed:
     print("horse-browser: %s %d orphan tab(s) from ended sessions"

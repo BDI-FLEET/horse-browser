@@ -671,6 +671,82 @@ def test_reap_own_tabs_never_asks_the_extension(tmp_path, monkeypatch):
     assert not [m for (m, _p, _s) in d.cdp.calls if m == "Runtime.evaluate"]
 
 
+# ── the blank sweep ── an idle session gives back the tabs that hold nothing ────────
+
+
+_OWN_AND_FOREIGN = {"targetInfos": [
+    {"targetId": "MINE-BLANK", "type": "page", "url": "about:blank"},
+    {"targetId": "MINE-WORK", "type": "page", "url": "https://example.com/"},
+    {"targetId": "BOUND-BLANK", "type": "page", "url": ""},
+    {"targetId": "THEIRS-BLANK", "type": "page", "url": "about:blank"},
+    {"targetId": "SW1", "type": "service_worker", "url": ""},
+]}
+
+
+def test_blank_sweep_closes_only_the_sessions_own_blank_tabs(tmp_path, monkeypatch):
+    _registry(tmp_path, monkeypatch, ["MINE-BLANK", "MINE-WORK", "ALREADY-GONE"])
+    d = daemon.Daemon()
+    d.target_id = "BOUND-BLANK"
+    d.cdp = _ScriptedCDP({"Target.getTargets": _OWN_AND_FOREIGN})
+
+    closed = asyncio.run(d._close_own_blank_tabs())
+
+    assert sorted(closed) == ["BOUND-BLANK", "MINE-BLANK"]
+    assert [p["targetId"] for (m, p, _s) in d.cdp.calls if m == "Target.closeTarget"] == closed
+
+
+def test_blank_sweep_reports_only_what_actually_closed(tmp_path, monkeypatch):
+    _registry(tmp_path, monkeypatch, ["MINE-BLANK"])
+    d = daemon.Daemon()
+
+    def refuse(_params, _sid):
+        raise RuntimeError("No target with given id found")
+
+    d.cdp = _ScriptedCDP({"Target.getTargets": _OWN_AND_FOREIGN, "Target.closeTarget": refuse})
+
+    assert asyncio.run(d._close_own_blank_tabs()) == []
+
+
+def _run_sweeper(d, monkeypatch, ttl, idle_for):
+    swept = []
+
+    async def record():
+        swept.append(True)
+        d.stop.set()
+
+    async def go():
+        d.stop = asyncio.Event()
+        d.last_request = daemon.time.monotonic() - idle_for
+        d._close_own_blank_tabs = record
+        try:
+            await asyncio.wait_for(d._blank_sweeper(interval=0.01), timeout=0.2)
+        except asyncio.TimeoutError:
+            pass
+
+    monkeypatch.setattr(daemon, "BLANK_TTL", ttl)
+    asyncio.run(go())
+    return bool(swept)
+
+
+def test_blank_sweeper_waits_for_the_session_to_fall_silent(monkeypatch):
+    assert _run_sweeper(daemon.Daemon(), monkeypatch, ttl=60, idle_for=5) is False
+
+
+def test_blank_sweeper_sweeps_once_the_session_has_been_silent_for_the_ttl(monkeypatch):
+    assert _run_sweeper(daemon.Daemon(), monkeypatch, ttl=60, idle_for=61) is True
+
+
+def test_a_ping_does_not_count_as_the_session_calling(monkeypatch):
+    d = _fresh_daemon()
+    d.last_request = 1.0
+
+    asyncio.run(d.handle({"meta": "ping"}))
+    assert d.last_request == 1.0
+
+    asyncio.run(d.handle({"meta": "current_tab"}))
+    assert d.last_request > 1.0
+
+
 # ── the tab registry ── the daemon mints tabs of its own, so it records them too ────
 
 

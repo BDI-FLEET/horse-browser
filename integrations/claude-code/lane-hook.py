@@ -72,6 +72,7 @@ def close_lane_tabs(bu):
     ~50 lines of hand-rolled CDP-over-websocket that existed only to ask the extension
     which tabs carried the lane's group title. A no-op unless the browser is already up.
     """
+    import urllib.error
     import urllib.request
     f = os.path.expanduser("~/.config/horse-browser/tabs/" + bu)
     try:
@@ -79,12 +80,19 @@ def close_lane_tabs(bu):
     except Exception:
         return
     port = _port()
+    unclosed = False
     for tid in ids:
         try:
             urllib.request.urlopen("http://127.0.0.1:%s/json/close/%s" % (port, tid),
                                    timeout=3).read()
+        except urllib.error.HTTPError as e:
+            unclosed = unclosed or e.code != 404    # 404: the tab was already gone
         except Exception:
-            pass
+            unclosed = True
+    if unclosed:
+        # The registry is the one record of these tabs. Its daemon is about to be stopped,
+        # so the launcher's reaper reads it as an ended session and closes what is left.
+        return
     try:
         os.unlink(f)                        # the registry dies with the lane
     except OSError:

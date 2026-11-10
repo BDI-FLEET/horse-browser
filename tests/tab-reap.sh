@@ -70,7 +70,21 @@ PY
 make_ungrouped_blank() {  # mint a raw ungrouped about:blank (like the daemon's attach-blank)
   curl -s -X PUT "http://127.0.0.1:$PORT/json/new?about:blank" >/dev/null 2>&1
 }
-reap() { HORSE_BROWSER_REAP_INTERVAL=0 HORSE_BROWSER_REAP_STAMP="$(mktemp)" "$HB" >/dev/null 2>&1; }
+# A reap that takes a stray of any age; the age gate has a check of its own in [2].
+reap() { HORSE_BROWSER_STRAY_AGE="${STRAY_AGE:-0}" HORSE_BROWSER_REAP_INTERVAL=0 HORSE_BROWSER_REAP_STAMP="$(mktemp)" "$HB" >/dev/null 2>&1; }
+make_grouped_blank() {  # a blank in a tab group that no registry claims — what a relaunch restores
+  python3 - "$PORT" "$HERE/../tools" <<'PY' >/dev/null 2>&1
+import json, sys, urllib.request
+sys.path.insert(0, sys.argv[2]); import sw_eval
+port = sys.argv[1]
+req = urllib.request.Request(f"http://127.0.0.1:{port}/json/new?about:blank", method="PUT")
+tid = json.load(urllib.request.urlopen(req))["id"]
+sw_eval.evaluate(port, "self.groupTab(%s, 'reaptest-restored')" % json.dumps(tid), 5)
+PY
+}
+grouped_blanks() {  # count about:blank tabs that sit in a tab group
+  python3 "$HERE/../tools/sw_eval.py" "$PORT" "(async()=>{const t=await chrome.tabs.query({});return t.filter(x=>x.groupId>=0 && ((x.url||'')===''||x.url==='about:blank')).length;})()" 5 2>/dev/null
+}
 
 say "horse-browser tab-reap — port $PORT"
 
@@ -170,6 +184,28 @@ else
     || fail "reaper closes a stray ungrouped about:blank" "$ub0->$ub1->$ub2"
 fi
 
+# A relaunch restores every tab with its group and a NEW id, so no registry claims it. The
+# group is no claim: such a blank is a stray like any other. Measured on the grouped count,
+# which the adopted blanks of this suite's own live sessions never leave (they are claimed).
+if [ "$have_fn" != "function" ]; then
+  skip "reaper closes a grouped blank no registry claims" "extension sweepStrayTabs not loaded"
+  skip "reaper leaves a stray younger than the age gate" "extension sweepStrayTabs not loaded"
+else
+  gb0="$(grouped_blanks)"
+  make_grouped_blank; sleep 0.5
+  gb1="$(grouped_blanks)"
+  STRAY_AGE=3600 reap
+  gb2="$(grouped_blanks)"
+  reap
+  gb3="$(grouped_blanks)"
+  { [ "${gb1:-0}" -gt "${gb0:-0}" ] && [ "${gb2:-0}" -eq "${gb1:-0}" ]; } \
+    && pass "reaper leaves a stray younger than the age gate ($gb0->$gb1->$gb2)" \
+    || fail "reaper leaves a stray younger than the age gate" "$gb0->$gb1->$gb2"
+  { [ "${gb1:-0}" -gt "${gb0:-0}" ] && [ "${gb3:-0}" -le "${gb0:-0}" ]; } \
+    && pass "reaper closes a grouped blank no registry claims ($gb0->$gb1->$gb3)" \
+    || fail "reaper closes a grouped blank no registry claims" "$gb0->$gb1->$gb3"
+fi
+
 # ═════ 3. safety: empty live set never reaps ═════════════════════════════════
 say "[3] safety stop"
 # The guard that keeps the two rules from colliding. groupTab is best-effort, so one of a
@@ -237,6 +273,72 @@ else
     && pass "no leaked tabs from the crashed session" \
     || fail "no leaked tabs after an unclean death" "HYG-WORK still has ${ht} tab(s)"
 fi
+
+# ═════ 5. idle blank sweep: a silent session gives back its blank tabs ═══════
+# The reaper above only acts once a session has ENDED. A session that is still open but done
+# browsing would hold its blanks for as long as its process lives; its own daemon closes them
+# after HORSE_BROWSER_BLANK_TTL seconds without a call, and never a tab with a page in it.
+say "[5] idle blank sweep"
+IDLE="reaptest-$$-idle$$"
+i0="$(blanks)"
+HORSE_SESSION="$IDLE" HORSE_BROWSER_BLANK_TTL=2 HORSE_BROWSER_NO_REAP=1 "$HB" <<'PY' >/dev/null 2>&1
+import urllib.parse
+open_tab("data:text/html,"+urllib.parse.quote("<title>IDLE-WORK</title>x"))
+wait_for_load()
+switch_tab(cdp("Target.createTarget", url="about:blank", background=True)["targetId"])
+PY
+i1="$(blanks)"
+sleep 5
+i2="$(blanks)"
+{ [ "${i1:-0}" -gt "${i0:-0}" ] && [ "${i2:-0}" -le "${i0:-0}" ]; } \
+  && pass "a silent session's blank tab is closed after the TTL ($i0->$i1->$i2)" \
+  || fail "a silent session's blank tab is closed after the TTL" "$i0->$i1->$i2"
+[ "$(titled IDLE-WORK)" -eq 1 ] \
+  && pass "the sweep leaves the session's loaded tab alone" \
+  || fail "the sweep leaves the session's loaded tab alone" "IDLE-WORK $(titled IDLE-WORK)"
+back="$(HORSE_SESSION="$IDLE" HORSE_BROWSER_BLANK_TTL=2 HORSE_BROWSER_NO_REAP=1 "$HB" <<<'print("BACK", "IDLE-WORK" in page_info()["url"])' 2>/dev/null | sed -n 's/^BACK //p')"
+[ "$back" = "True" ] \
+  && pass "the next call after a sweep lands on the session's remaining tab" \
+  || fail "the next call after a sweep lands on the session's remaining tab" "got '${back}'"
+ipid="$(daemon_pid_for "$IDLE")"; [ -n "$ipid" ] && kill "$ipid" 2>/dev/null
+
+# The commonest shape: a session that holds nothing but its blank. The sweep takes it, and the
+# call after that gets exactly one tab back, as a first call does.
+ONLY="reaptest-$$-only$$"
+o0="$(blanks)"
+HORSE_SESSION="$ONLY" HORSE_BROWSER_BLANK_TTL=2 HORSE_BROWSER_NO_REAP=1 "$HB" <<<'page_info()' >/dev/null 2>&1
+o1="$(blanks)"
+sleep 5
+o2="$(blanks)"
+{ [ "${o1:-0}" -gt "${o0:-0}" ] && [ "${o2:-0}" -eq "${o0:-0}" ]; } \
+  && pass "a silent blank-only session is left with no tab ($o0->$o1->$o2)" \
+  || fail "a silent blank-only session is left with no tab" "$o0->$o1->$o2"
+again="$(HORSE_SESSION="$ONLY" HORSE_BROWSER_BLANK_TTL=2 HORSE_BROWSER_NO_REAP=1 "$HB" <<<'print("AGAIN", page_info()["url"], len(list_tabs()))' 2>/dev/null | sed -n 's/^AGAIN //p')"
+o3="$(blanks)"
+{ [ "$again" = "about:blank 1" ] && [ "${o3:-0}" -eq $(( ${o0:-0} + 1 )) ]; } \
+  && pass "the call after that sweep gets one blank back, not two ($o2->$o3)" \
+  || fail "the call after that sweep gets one blank back, not two" "call='$again' blanks $o2->$o3"
+opid="$(daemon_pid_for "$ONLY")"; [ -n "$opid" ] && kill "$opid" 2>/dev/null
+
+# ═════ 6. a finished sub-agent's lane: its registry outlives tabs that did not close ═════
+say "[6] lane registry"
+LANEHOME="$(mktemp -d)"; LBU="hb-lanetestsid-agentx"
+mkdir -p "$LANEHOME/.config/horse-browser/tabs" "$LANEHOME/.config/browser-harness/runtime"
+lane_stop() {  # $1 = the port the hook is to find the browser on
+  echo '["0000000000000000000000000000DEAD"]' >| "$LANEHOME/.config/horse-browser/tabs/$LBU"
+  : >| "$LANEHOME/.config/browser-harness/runtime/bu-$LBU.pid"
+  echo '{"hook_event_name":"SubagentStop","agent_id":"agentx","session_id":"x-lanetestsid"}' \
+    | HOME="$LANEHOME" HORSE_BROWSER_PORT="$1" python3 "$HERE/../integrations/claude-code/lane-hook.py"
+}
+lane_stop 1
+[ -e "$LANEHOME/.config/horse-browser/tabs/$LBU" ] \
+  && pass "a lane whose tabs could not be closed keeps its registry for the reaper" \
+  || fail "a lane whose tabs could not be closed keeps its registry for the reaper"
+lane_stop "$PORT"
+[ ! -e "$LANEHOME/.config/horse-browser/tabs/$LBU" ] \
+  && pass "a lane whose tabs are gone takes its registry with it" \
+  || fail "a lane whose tabs are gone takes its registry with it"
+rm -rf "$LANEHOME"
 
 say ""
 say "── $PASS passed, $FAIL failed, $SKIP skipped"

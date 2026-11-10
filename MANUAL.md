@@ -192,7 +192,8 @@ its service_worker target and `Runtime.evaluate` (this is what `ext_call` / `bh_
 self.groupTab(targetId, label)  -> tabId       // paint the tab into `label`'s group (best-effort)
 self.activateTab(targetId)      -> tabId       // make it the visible tab WITHOUT raising the window
 self.activeTabTargets()         -> targetId[]  // the visible tab of each window (no CDP equivalent)
-self.sweepStrayTabs(claimed)    -> {closed}    // close ungrouped about:blank no registry claims
+self.sweepStrayTabs(claimed, minAgeMs) -> {closed}  // close about:blank no registry claims
+self.countStrayTabs(claimed, minAgeMs) -> {closed}  // the same count, closing nothing
 ```
 
 None of these is a source of truth. Which tabs belong to a session is answered by that
@@ -241,6 +242,12 @@ Glance at `list_tabs()` before opening many tabs; close stale ones via raw CDP
 (`cdp("Target.closeTarget", targetId=t["targetId"])`). Close the rest when a task ends —
 Chrome removes empty groups, so a disciplined session leaves zero clutter. (A daemon whose
 session dies also self-reaps its group, so this is politeness, not a leak backstop.)
+
+A session that is still open but silent gives back its blank tabs on its own: after
+`HORSE_BROWSER_BLANK_TTL` seconds without a call (default 600; `0` keeps them) its daemon
+closes every tab its registry claims whose address is still `about:blank`. A page written
+into such a tab without navigating it reads as blank too, so navigate what must last. The next
+call re-attaches as a first call does — to one of the session's remaining tabs, or a new one.
 
 ## Diagnostics & gotchas
 
