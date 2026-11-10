@@ -266,7 +266,10 @@ for t in list_tabs():
     try: cdp("Target.closeTarget", targetId=t["targetId"])
     except Exception: pass
 """ % PORT
+    # A test run must never reach the operator's ~/.claude or ~/.grok: without this the
+    # launcher wires THIS checkout's path into the real settings.json and rule file.
     r = subprocess.run([os.path.join(ROOT, "bin", "horse-browser")], input=script,
+                       env={**os.environ, "HORSE_BROWSER_NO_RECONCILE": "1"},
                        text=True, capture_output=True, timeout=300)
     for line in (r.stdout or "").splitlines():
         if line.startswith("EVENTS"):
